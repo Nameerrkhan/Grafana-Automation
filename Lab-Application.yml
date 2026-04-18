@@ -1,27 +1,29 @@
-
 AWSTemplateFormatVersion: "2010-09-09"
-Description: 
-  Lab Application Stack, provisions the Grafana EC2 server (t3.micro,
-  Amazon Linux 2023) inside the network created by Lab-Network.yml.
-# ─────────────────────────────────────────────
-#  Parameters
-# ─────────────────────────────────────────────
+Description: Lab Application Stack for Grafana on Minikube running on EC2
+
+# ============================================================
+# Parameters
+# ============================================================
 Parameters:
- 
+  # Use the latest Amazon Linux 2023 AMI from AWS SSM
   LatestAmazonLinux2023AmiId:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
     Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
-    Description: >
-      Automatically resolves to the latest Amazon Linux 2023 AMI ID in the
-      current region.  Override only if you need a specific AMI.
- 
-# ─────────────────────────────────────────────
-#  Resources
-# ─────────────────────────────────────────────
+    Description: Latest Amazon Linux 2023 AMI ID
+
+# ============================================================
+# Resources
+# ============================================================
 Resources:
- 
-  # ── Security Group ────────────────────────────
-  GrafanaSecurityGroup: #(Lab Security Group)
+
+  # ------------------------------------------------------------
+  # Security group for the EC2 server
+  # Opens:
+  # - port 22 for SSH
+  # - port 3000 for Grafana access
+  # VPC is imported from the network stack
+  # ------------------------------------------------------------
+  GrafanaSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Allow SSH and Grafana access
@@ -36,58 +38,178 @@ Resources:
           FromPort: 3000
           ToPort: 3000
           CidrIp: 0.0.0.0/0
-          Description: Grafana web interface
+          Description: Grafana web access
       Tags:
         - Key: Name
           Value: lab-grafana-sg
- 
-  # ── EC2 Instance ──────────────────────────────
+
+  # ------------------------------------------------------------
+  # EC2 instance for Docker + Minikube + Grafana on Kubernetes
+  # ------------------------------------------------------------
   GrafanaEC2Instance:
     Type: AWS::EC2::Instance
     Properties:
-      ImageId: !Ref LatestAmazonLinux2023AmiId #Replace with id#
-      InstanceType: t3.micro
+      ImageId: !Ref LatestAmazonLinux2023AmiId
+      InstanceType: t2.medium
       KeyName: vockey
-      SubnetId: !ImportValue LabPublicSubnetId 
-      #one more way to write this: 
-      #SubnetId: 
-        #Fn:: ImportValue: LabPublicSubnetId
+      SubnetId: !ImportValue LabPublicSubnetId
       SecurityGroupIds:
         - !Ref GrafanaSecurityGroup
       Tags:
         - Key: Name
           Value: Grafana
+
+      # ========================================================
+      # UserData / cloud-init
+      # Creates:
+      # - /tmp/grafana.yml
+      # - /tmp/grafanainstall.sh
+      # Then runs the install script
+      # ========================================================
       UserData:
         Fn::Base64: |
           #!/bin/bash
-          # ── System update ──────────────────────────
-          yum update -y
- 
-          # ── Install Grafana Enterprise ─────────────
-          yum install -y https://dl.grafana.com/grafana-enterprise/release/12.2.1/grafana-enterprise_12.2.1_18655849634_linux_amd64.rpm
- 
-          # ── Enable and start Grafana service ───────
-          systemctl enable grafana-server.service
-          systemctl start  grafana-server.service
- 
-          # ── (Placeholder) Minikube installation ────
-          # Additional Minikube setup commands can be
-          # appended here by Member 2 (Compute).
- 
-# ─────────────────────────────────────────────
-#  Outputs
-# ─────────────────────────────────────────────
+
+          # Create Kubernetes YAML file in /tmp
+          tee /tmp/grafana.yml > /dev/null <<'EOF'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: grafana-pvc
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 1Gi
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            labels:
+              app: grafana
+            name: grafana
+          spec:
+            selector:
+              matchLabels:
+                app: grafana
+            template:
+              metadata:
+                labels:
+                  app: grafana
+              spec:
+                securityContext:
+                  fsGroup: 472
+                  supplementalGroups:
+                    - 0
+                containers:
+                  - name: grafana
+                    image: grafana/grafana:latest
+                    imagePullPolicy: IfNotPresent
+                    ports:
+                      - containerPort: 3000
+                    readinessProbe:
+                      failureThreshold: 3
+                      httpGet:
+                        path: /robots.txt
+                        port: 3000
+                        scheme: HTTP
+                      initialDelaySeconds: 10
+                      periodSeconds: 30
+                      successThreshold: 1
+                      timeoutSeconds: 2
+                    livenessProbe:
+                      failureThreshold: 3
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+                      successThreshold: 1
+                      tcpSocket:
+                        port: 3000
+                      timeoutSeconds: 1
+                    resources:
+                      requests:
+                        cpu: 250m
+                        memory: 750Mi
+                    volumeMounts:
+                      - mountPath: /var/lib/grafana
+                        name: grafana-pv
+                volumes:
+                  - name: grafana-pv
+                    persistentVolumeClaim:
+                      claimName: grafana-pvc
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: grafana
+          spec:
+            ports:
+              - port: 3000
+                targetPort: 3000
+            selector:
+              app: grafana
+            type: NodePort
+          EOF
+
+          # Create EC2 install script in /tmp
+          tee /tmp/grafanainstall.sh > /dev/null <<'EOF'
+          #!/bin/bash
+          set -euxo pipefail
+
+          # Update packages and install Docker + curl
+          dnf update -y
+          dnf install -y docker 
+
+          # Enable and start Docker
+          systemctl enable docker
+          systemctl start docker
+
+          # Download and install Minikube
+          curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+          install minikube-linux-amd64 /usr/local/bin/minikube
+          chmod +x /usr/local/bin/minikube
+
+          # Remove any old Minikube cluster if present
+          minikube stop || true
+          minikube delete || true
+
+          # Wait briefly before starting Minikube
+          sleep 10
+
+          # Start Minikube using Docker driver
+          minikube start --driver=docker --force --memory=2200mb
+
+          # Wait for Kubernetes startup
+          sleep 20
+
+          # Deploy Grafana to Kubernetes
+          minikube kubectl -- apply -f /tmp/grafana.yml
+
+          # Wait for Grafana objects to come up
+          sleep 20
+
+          # Start port-forward in background so Grafana is reachable
+          nohup minikube kubectl -- port-forward --address 0.0.0.0 service/grafana 3000:3000 > /tmp/grafana-portforward.log 2>&1 &
+          EOF
+
+          # Make the install script executable
+          chmod +x /tmp/grafanainstall.sh
+
+          # Run the script and send output to cloud-init log
+          su - -c "/bin/bash /tmp/grafanainstall.sh" >> /var/log/cloud-init-output.log 2>&1
+
+# ============================================================
+# Outputs
+# ============================================================
 Outputs:
- 
   GrafanaInstanceId:
     Description: EC2 instance ID for the Grafana server
     Value: !Ref GrafanaEC2Instance
- 
+
   GrafanaPublicIP:
     Description: Public IP address of the Grafana server
     Value: !GetAtt GrafanaEC2Instance.PublicIp
- 
+
   GrafanaURL:
     Description: URL to access the Grafana dashboard
     Value: !Sub "http://${GrafanaEC2Instance.PublicIp}:3000"
- 
